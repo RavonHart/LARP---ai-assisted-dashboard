@@ -1,0 +1,19 @@
+{
+  "name": "ai-skills-agents-dashboard",
+  "private": true,
+  "version": "1.0.0",
+  "description": "An AI-powered Skills & Agents Dashboard built as a TypeScript monorepo",
+  "scripts": {
+    "dev": "concurrently \"pnpm --filter client dev\" \"pnpm --filter server dev\"",
+    "build": "pnpm -r build",
+    "lint": "pnpm -r lint",
+    "format": "prettier --write \"**/*.{ts,tsx,js,json,md}\"",
+    "test": "pnpm -r test"
+  },
+  "devDependencies": {
+    "concurrently": "^9.1.0",
+    "eslint": "^9.16.0",
+    "prettier": "^3.4.2",
+    "typescript": "^5.7.2"
+  }
+}

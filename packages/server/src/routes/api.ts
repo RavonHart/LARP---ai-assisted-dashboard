@@ -12,6 +12,7 @@ import { planningService } from '../services/planning.js';
 import { executionService } from '../services/execution.js';
 import { z } from 'zod';
 import crypto from 'crypto';
+import archiver from 'archiver';
 
 const router: Router = Router();
 
@@ -258,6 +259,79 @@ router.get('/result/:sessionId', async (req, res) => {
     });
   } catch (error: any) {
     res.status(500).json({ error: error.message || 'Failed to aggregate build results.' });
+  }
+});
+
+// ==========================================
+// 7. GET /api/execution/:sessionId/download - Download artifacts as zip
+// ==========================================
+router.get('/execution/:sessionId/download', async (req, res) => {
+  try {
+    const { sessionId } = req.params;
+
+    const [session] = await db
+      .select()
+      .from(executionSessions)
+      .where(eq(executionSessions.id, sessionId));
+
+    if (!session) {
+      res.status(404).json({ error: 'Session not found.' });
+      return;
+    }
+
+    if (!session.planId) {
+      res.status(400).json({ error: 'Session has no plan associated.' });
+      return;
+    }
+
+    const dbExecutions = await db
+      .select()
+      .from(agentExecutions)
+      .where(eq(agentExecutions.planId, session.planId));
+
+    // Initialize compression archiver
+    const archive = archiver('zip', { zlib: { level: 9 } });
+
+    res.setHeader('Content-Type', 'application/zip');
+    res.setHeader('Content-Disposition', `attachment; filename="ai-build-${sessionId}.zip"`);
+
+    archive.on('warning', (err) => {
+      if (err.code === 'ENOENT') {
+        console.warn('[Archiver Warning]:', err);
+      } else {
+        throw err;
+      }
+    });
+
+    archive.on('error', (err) => {
+      console.error('[Archiver Error]:', err);
+      res.status(500).send({ error: err.message });
+    });
+
+    archive.pipe(res);
+
+    // Append each agent execution artifact to package
+    for (const exec of dbExecutions) {
+      if (exec.artifacts) {
+        try {
+          const artifacts = JSON.parse(exec.artifacts);
+          for (const [filename, content] of Object.entries(artifacts)) {
+            if (typeof content === 'string') {
+              archive.append(content, { name: filename });
+            }
+          }
+        } catch (jsonErr) {
+          console.error('[Archiver] Failed to parse artifacts:', exec.id, jsonErr);
+        }
+      }
+    }
+
+    await archive.finalize();
+  } catch (error: any) {
+    console.error('[Download Error]:', error);
+    if (!res.headersSent) {
+      res.status(500).json({ error: error.message || 'Failed to compile zip file download.' });
+    }
   }
 });
 

@@ -23,7 +23,8 @@ import {
   Coins, 
   Code, 
   FileCode, 
-  Terminal
+  Terminal,
+  Download
 } from 'lucide-react';
 import React from 'react';
 import { io } from 'socket.io-client';
@@ -839,13 +840,23 @@ function ExecutionComponent() {
             <p className="text-xs text-neutral-300 leading-relaxed">
               {synthesisReport.session.userTask}
             </p>
-            <div className="flex flex-wrap gap-2 pt-2 text-[11px] text-neutral-500">
-              <span className="bg-neutral-900 px-2 py-0.5 rounded border border-neutral-800">
-                Completed in ~{executedSteps.length * 2} seconds
-              </span>
-              <span className="bg-neutral-900 px-2 py-0.5 rounded border border-neutral-800 text-emerald-400">
-                Cost: ${totalCost.toFixed(5)}
-              </span>
+            <div className="flex flex-wrap items-center justify-between gap-4 pt-2">
+              <div className="flex flex-wrap gap-2 text-[11px] text-neutral-500">
+                <span className="bg-neutral-900 px-2 py-0.5 rounded border border-neutral-800">
+                  Completed in ~{executedSteps.length * 2} seconds
+                </span>
+                <span className="bg-neutral-900 px-2 py-0.5 rounded border border-neutral-800 text-emerald-400">
+                  Cost: ${totalCost.toFixed(5)}
+                </span>
+              </div>
+              <a 
+                href={`/api/execution/${sessionId}/download`}
+                download
+                className="px-3 py-1.5 rounded bg-white text-black hover:bg-neutral-200 font-semibold text-[11px] transition-colors flex items-center space-x-1.5"
+              >
+                <Download className="w-3.5 h-3.5" />
+                <span>Download Source (.zip)</span>
+              </a>
             </div>
           </div>
 

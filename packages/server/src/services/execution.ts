@@ -3,12 +3,10 @@ import {
   executionPlans, 
   executionSessions, 
   agentExecutions, 
-  agents as agentsTable, 
-  skills as skillsTable 
+  agents as agentsTable
 } from '../db/schema.js';
 import { eq } from 'drizzle-orm';
 import { socketService } from './socket.js';
-import { ArtifactGenerator } from './generator.js';
 import { AgentOutput } from '@dashboard/shared';
 import crypto from 'crypto';
 
@@ -50,163 +48,191 @@ export class ExecutionService {
     sequence: string[],
     selectedSkills: { language: string; frameworks: string[]; methodologies: string[] }
   ): Promise<void> {
-    console.info(`[ExecutionService] Starting pipeline loop for session: ${sessionId}`);
-    const previousOutputs: AgentOutput[] = [];
+    console.info(`[ExecutionService] Starting remote Python graph execution for session: ${sessionId}`);
     let totalTokensUsed = 0;
     let totalCost = 0;
+    const allAgents = await db.select().from(agentsTable);
 
     try {
-      // Load all catalog skills and agents from DB for context injection
-      const allSkills = await db.select().from(skillsTable);
-      const allAgents = await db.select().from(agentsTable);
+      const response = await fetch('http://localhost:8000/run-graph', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          task,
+          language: selectedSkills.language,
+          frameworks: selectedSkills.frameworks,
+        }),
+      });
 
-      for (let i = 0; i < sequence.length; i++) {
+      if (!response.ok) {
+        throw new Error(`Python microservice returned error status: ${response.status}`);
+      }
+
+      if (!response.body) {
+        throw new Error('No response body from Python microservice');
+      }
+
+      // @ts-ignore
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = '';
+
+      const agentIdMap: Record<string, string> = {
+        architect: 'architect',
+        db_designer: 'db-designer',
+        developer: 'backend-dev',
+        tester: 'tester',
+        reviewer: 'code-reviewer',
+      };
+
+      while (true) {
         // Check if session job was aborted
         if (!this.activeJobs.get(sessionId)) {
           console.warn(`[ExecutionService] Session ${sessionId} aborted mid-pipeline.`);
           return;
         }
 
-        const agentId = sequence[i];
-        const dbAgent = allAgents.find((a) => a.id === agentId);
-        if (!dbAgent) {
-          throw new Error(`[ExecutionService] Agent definition not found in catalog: ${agentId}`);
-        }
+        const { done, value } = await reader.read();
+        if (done) break;
 
-        const executionId = `exec-${crypto.randomUUID().slice(0, 8)}`;
-        console.info(`[ExecutionService] Starting agent: ${dbAgent.name} (${i + 1}/${sequence.length})`);
+        buffer += decoder.decode(value, { stream: true });
+        const lines = buffer.split('\n');
+        buffer = lines.pop() || '';
 
-        // Filter and compile injected skills for this agent
-        const appliesToAgent = (skill: typeof allSkills[0]) => {
-          try {
-            const list = JSON.parse(skill.appliesTo || '[]') as string[];
-            return list.includes(agentId);
-          } catch {
-            return false;
+        for (const line of lines) {
+          if (line.startsWith('data: ')) {
+            const dataStr = line.slice(6).trim();
+            if (!dataStr) continue;
+
+            let event: any;
+            try {
+              event = JSON.parse(dataStr);
+            } catch (err) {
+              console.error('Failed to parse SSE JSON chunk:', dataStr, err);
+              continue;
+            }
+
+            // Broadcast general progress event as requested
+            socketService.emitToSession(sessionId, 'progress', event);
+
+            // Handle END/Complete signal
+            if (event.event === 'complete') {
+              console.info(`[ExecutionService] Python graph execution complete signal received.`);
+              continue;
+            }
+
+            // Identify node update
+            const nodeNames = Object.keys(event);
+            if (nodeNames.length === 0) continue;
+            const nodeName = nodeNames[0];
+
+            // Map Python node name to DB Agent ID
+            const agentId = agentIdMap[nodeName];
+            if (!agentId) {
+              continue;
+            }
+
+            const dbAgent = allAgents.find((a) => a.id === agentId);
+            if (!dbAgent) continue;
+
+            const nodeOutput = event[nodeName];
+
+            // 1. Emit agent started
+            socketService.emitToSession(sessionId, 'agent_started', {
+              agentId,
+              name: dbAgent.name,
+              emoji: dbAgent.emoji,
+              message: `${dbAgent.name} is compiling output...`,
+            });
+
+            // Add UX pacing delay so the user sees the transitions
+            await delay(1000);
+
+            // 2. Prepare mock artifact outputs and structure
+            const executionId = `exec-${crypto.randomUUID().slice(0, 8)}`;
+            const artifacts: Record<string, string> = {};
+            let reasoning = '';
+            let summary = '';
+            let status: 'success' | 'failed' | 'needs_revision' = 'success';
+
+            if (nodeName === 'architect') {
+              artifacts['architecture_doc.md'] = nodeOutput.architecture_doc || '';
+              reasoning = 'Designed system architecture design components and layout.';
+              summary = 'Completed architectural design.';
+            } else if (nodeName === 'db_designer') {
+              artifacts['schema.sql'] = nodeOutput.db_schema || '';
+              reasoning = 'Structured relational schemas and tables.';
+              summary = 'Completed DB schema creation.';
+            } else if (nodeName === 'developer') {
+              artifacts['app.py'] = nodeOutput.code || '';
+              reasoning = 'Wrote backend services and routing endpoints.';
+              summary = 'Completed backend code implementation.';
+            } else if (nodeName === 'tester') {
+              artifacts['test_results.txt'] = nodeOutput.test_results || '';
+              reasoning = 'Configured tests and validated backend behaviors.';
+              summary = 'Completed automated test execution.';
+            } else if (nodeName === 'reviewer') {
+              artifacts['review_feedback.md'] = nodeOutput.review_feedback || '';
+              reasoning = 'Reviewed overall codebase compliance and design guidelines.';
+              if (nodeOutput.status === 'complete') {
+                summary = 'Passed code review with success.';
+                status = 'success';
+              } else {
+                summary = 'Failed code review. Code revision requested.';
+                status = 'needs_revision';
+              }
+            }
+
+            const mockTokens = dbAgent.estimatedTokens || 4000;
+            const mockCost = status === 'success' ? 0.015 : 0.01;
+
+            totalTokensUsed += mockTokens;
+            totalCost += mockCost;
+
+            const outputData: AgentOutput = {
+              id: `out-${crypto.randomUUID().slice(0, 8)}`,
+              agent_id: agentId,
+              status,
+              raw_response: JSON.stringify(nodeOutput),
+              parsed_output: {
+                reasoning,
+                artifacts,
+                summary,
+              },
+            };
+
+            // 3. Save to database
+            await db.insert(agentExecutions).values({
+              id: executionId,
+              planId,
+              agentId,
+              sequencePosition: sequence.indexOf(agentId) + 1,
+              status: 'completed',
+              inputContext: JSON.stringify({ task, injectedSkills: [] }),
+              outputJson: JSON.stringify(outputData),
+              reasoning,
+              artifacts: JSON.stringify(artifacts),
+              summary,
+              tokensInput: Math.round(mockTokens * 0.6),
+              tokensOutput: Math.round(mockTokens * 0.4),
+              costUsd: mockCost,
+              durationSeconds: 1,
+              modelUsed: 'claude-3-5-sonnet',
+              createdAt: new Date().toISOString(),
+              completedAt: new Date().toISOString(),
+            });
+
+            // 4. Emit agent completed
+            socketService.emitToSession(sessionId, 'agent_completed', {
+              agentId,
+              name: dbAgent.name,
+              output: outputData,
+              tokensUsed: mockTokens,
+              costUsed: mockCost,
+            });
           }
-        };
-        const agentSkills = allSkills
-          .filter((s) => appliesToAgent(s))
-          .map((s) => ({
-            id: s.id,
-            name: s.name,
-            category: s.category as 'framework' | 'language' | 'methodology',
-            description: s.description || '',
-            content: s.content,
-            applies_to: JSON.parse(s.appliesTo || '[]'),
-            tags: JSON.parse(s.tags || '[]'),
-            version: s.version || '1.0',
-          }));
-
-        // Broadcast: Agent started thinking
-        socketService.emitToSession(sessionId, 'agent_started', {
-          agentId,
-          name: dbAgent.name,
-          emoji: dbAgent.emoji,
-          message: `${dbAgent.name} is inspecting requirements...`,
-        });
-
-        // Insert pending agent execution record into DB
-        await db.insert(agentExecutions).values({
-          id: executionId,
-          planId,
-          agentId,
-          sequencePosition: i + 1,
-          status: 'running',
-          inputContext: JSON.stringify({ task, previousOutputs, injectedSkills: agentSkills }),
-          createdAt: new Date().toISOString(),
-        });
-
-        // Simulate API network latency (e.g. 1.8 seconds)
-        await delay(1800);
-
-        // Fail hard simulation context:
-        // If task description has failure keywords and agent is backend-dev or tester, trigger failure
-        const forceFail = 
-          task.toLowerCase().includes('fail') || task.toLowerCase().includes('error');
-        if (forceFail && (agentId === 'backend-dev' || agentId === 'tester')) {
-          const failMsg = `[Simulated Compiler Error] ${dbAgent.name} failed to resolve module dependencies. Syntax issue detected in build pipelines.`;
-          throw new Error(failMsg);
         }
-
-        // Generate mock successful output
-        const generated = ArtifactGenerator.generateMockOutput(
-          agentId,
-          task,
-          selectedSkills.language,
-          selectedSkills.frameworks
-        );
-
-        const durationSeconds = 2; 
-        const mockCost = generated.parsed_output.quality_score ? 0.015 : 0.01;
-        const mockTokens = (dbAgent.estimatedTokens || 4000);
-
-        totalTokensUsed += mockTokens;
-        totalCost += mockCost;
-
-        const outputData: AgentOutput = {
-          id: `out-${crypto.randomUUID().slice(0, 8)}`,
-          agent_id: agentId,
-          status: generated.status as 'success' | 'failed' | 'needs_revision',
-          raw_response: generated.raw_response,
-          parsed_output: {
-            reasoning: generated.parsed_output.reasoning,
-            artifacts: generated.parsed_output.artifacts,
-            summary: generated.parsed_output.summary,
-            quality_score: generated.parsed_output.quality_score,
-          },
-        };
-
-        // Update database execution record as completed
-        await db
-          .update(agentExecutions)
-          .set({
-            status: 'completed',
-            outputJson: JSON.stringify(outputData),
-            reasoning: outputData.parsed_output.reasoning,
-            artifacts: JSON.stringify(outputData.parsed_output.artifacts),
-            summary: outputData.parsed_output.summary,
-            tokensInput: Math.round(mockTokens * 0.6),
-            tokensOutput: Math.round(mockTokens * 0.4),
-            costUsd: mockCost,
-            durationSeconds,
-            modelUsed: 'claude-3-5-sonnet',
-            completedAt: new Date().toISOString(),
-          })
-          .where(eq(agentExecutions.id, executionId));
-
-        previousOutputs.push(outputData);
-
-        // Broadcast: Agent completed run
-        socketService.emitToSession(sessionId, 'agent_completed', {
-          agentId,
-          name: dbAgent.name,
-          output: outputData,
-          tokensUsed: mockTokens,
-          costUsed: mockCost,
-        });
-
-        // Small delay between sequential agent chains for UX pacing
-        await delay(500);
       }
-
-      // ==========================================
-      // Phase 3: Synthesis Generation (Final Step)
-      // ==========================================
-      socketService.emitToSession(sessionId, 'agent_started', {
-        agentId: 'synthesizer',
-        name: 'Synthesizer',
-        emoji: '📝',
-        message: 'Compiling all generated files and creating setup guide...',
-      });
-      await delay(1200);
-
-      const synthesisText = ArtifactGenerator.generateSynthesis(
-        task,
-        selectedSkills.language,
-        selectedSkills.frameworks
-      );
-      const parsedSynthesis = JSON.parse(synthesisText);
 
       // Complete session state in DB
       await db
@@ -226,17 +252,17 @@ export class ExecutionService {
 
       // Broadcast complete event
       socketService.emitToSession(sessionId, 'execution_complete', {
-        summary: parsedSynthesis.summary,
-        howToRun: parsedSynthesis.how_to_run,
-        architectureSummary: parsedSynthesis.architecture_summary,
-        knownLimitations: parsedSynthesis.known_limitations,
-        nextSteps: parsedSynthesis.next_steps,
+        summary: 'LangGraph pipeline execution completed successfully.',
+        howToRun: 'Run Python packages to view results.',
+        architectureSummary: 'Completed architectural layout.',
+        knownLimitations: 'Simulated pipeline engine.',
+        nextSteps: 'Proceed to code deployments.',
         totalTokens: totalTokensUsed,
         totalCost,
       });
 
     } catch (error: any) {
-      console.error(`[ExecutionService] Hard Failure encountered on session ${sessionId}:`, error);
+      console.error(`[ExecutionService] Python pipeline crash on session ${sessionId}:`, error);
 
       // Update session and plan states to failed
       await db
